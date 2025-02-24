@@ -1,0 +1,8 @@
+app-text/xmlto text
+# required by net-im/telegram-desktop-bin-5.11.1::gentoo
+# required by telegram-desktop-bin (argument)
+>=x11-libs/gtk+-3.24.42-r1 wayland
+# required by x11-libs/gtk+-3.24.42-r1::gentoo[wayland]
+# required by net-im/telegram-desktop-bin-5.11.1::gentoo
+# required by telegram-desktop-bin (argument)
+>=media-libs/mesa-24.3.3 wayland

@@ -1,0 +1,1 @@
+gui-apps/yambar -alsa -backlight -battery -mpd -network -river xkb

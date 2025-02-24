@@ -1,0 +1,5 @@
+# required by =media-libs/mesa-25.0.0 (argument)
+# /var/db/repos/gentoo/profiles/package.mask:
+# Matt Turner <mattst88@gentoo.org> (2025-02-05)
+# Masked for testing
+=media-libs/mesa-25.0.0

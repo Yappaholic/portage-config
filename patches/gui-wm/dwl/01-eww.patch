@@ -1,0 +1,607 @@
+--- a/Makefile	2024-09-29 12:01:37.541046059 +0300
++++ b/Makefile	2024-09-29 12:13:24.312054194 +0300
+@@ -16,14 +16,18 @@
+ DWLCFLAGS = `$(PKG_CONFIG) --cflags $(PKGS)` $(WLR_INCS) $(DWLCPPFLAGS) $(DWLDEVCFLAGS) $(CFLAGS)
+ LDLIBS    = `$(PKG_CONFIG) --libs $(PKGS)` $(WLR_LIBS) -lm $(LIBS)
+ 
+-all: dwl
++all: dwl dwlmsg
+ dwl: dwl.o util.o dwl-ipc-unstable-v2-protocol.o
+ 	$(CC) dwl.o util.o dwl-ipc-unstable-v2-protocol.o $(DWLCFLAGS) $(LDFLAGS) $(LDLIBS) -o $@
+ dwl.o: dwl.c client.h config.h config.mk cursor-shape-v1-protocol.h \
+ 	pointer-constraints-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h \
+ 	wlr-output-power-management-unstable-v1-protocol.h xdg-shell-protocol.h \
+ 	dwl-ipc-unstable-v2-protocol.h
++dwlmsg: dwlmsg.o util.o dwl-ipc-unstable-v2-protocol.o
++	$(CC) $^ -lwayland-client -Wno-strict-prototypes $(DWLCFLAGS) -o $@
++dwlmsg.o: dwlmsg.c dwl-ipc-unstable-v2-client-protocol.h
+ util.o: util.c util.h
++dwl-ipc-unstable-v2-protocol-client.o: dwl-ipc-unstable-v2-client-protocol.h
+ dwl-ipc-unstable-v2-protocol.o: dwl-ipc-unstable-v2-protocol.c dwl-ipc-unstable-v2-protocol.h
+ 
+ # wayland-scanner is a tool which generates C headers and rigging for Wayland
+@@ -50,6 +54,9 @@
+ dwl-ipc-unstable-v2-protocol.h:
+ 	$(WAYLAND_SCANNER) server-header \
+ 		protocols/dwl-ipc-unstable-v2.xml $@
++dwl-ipc-unstable-v2-client-protocol.h:
++	$(WAYLAND_SCANNER) client-header \
++		protocols/dwl-ipc-unstable-v2.xml $@
+ dwl-ipc-unstable-v2-protocol.c:
+ 	$(WAYLAND_SCANNER) private-code \
+ 		protocols/dwl-ipc-unstable-v2.xml $@
+@@ -57,20 +64,22 @@
+ config.h:
+ 	cp config.def.h $@
+ clean:
+-	rm -f dwl *.o *-protocol.h
++	rm -f dwl dwlmsg *.o *-protocol.h
+ 
+ dist: clean
+ 	mkdir -p dwl-$(VERSION)
+ 	cp -R LICENSE* Makefile CHANGELOG.md README.md client.h config.def.h \
+-		config.mk protocols dwl.1 dwl.c util.c util.h dwl.desktop \
++		config.mk protocols dwl.1 dwl.c dwlmsg.c util.c util.h dwl.desktop \
+ 		dwl-$(VERSION)
+ 	tar -caf dwl-$(VERSION).tar.gz dwl-$(VERSION)
+ 	rm -rf dwl-$(VERSION)
+ 
+-install: dwl
++install: dwl dwlmsg
+ 	mkdir -p $(DESTDIR)$(PREFIX)/bin
+ 	cp -f dwl $(DESTDIR)$(PREFIX)/bin
+ 	chmod 755 $(DESTDIR)$(PREFIX)/bin/dwl
++	cp -f dwlmsg $(DESTDIR)$(PREFIX)/bin
++	chmod 755 $(DESTDIR)$(PREFIX)/bin/dwlmsg
+ 	mkdir -p $(DESTDIR)$(MANDIR)/man1
+ 	cp -f dwl.1 $(DESTDIR)$(MANDIR)/man1
+ 	chmod 644 $(DESTDIR)$(MANDIR)/man1/dwl.1
+--- /dev/null	2024-09-29 10:54:55.245091132 +0300
++++ b/dwlmsg.c	2024-09-29 12:13:24.313054194 +0300
+@@ -0,0 +1,546 @@
++#include <getopt.h>
++#include <stdio.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wayland-client-core.h>
++#include <wayland-client-protocol.h>
++#include <wayland-client.h>
++#include <wayland-util.h>
++#include "util.h"
++#include "dwl-ipc-unstable-v2-client-protocol.h"
++
++/*
++ * This is a modified version of the original `dwlmsg` program by notchoc at
++ * https://codeberg.org/notchoc/dwlmsg. All credits goes to notchoc for his
++ * excellent work.
++
++ * This version brings json fomatted output. However this is limited to single
++ * monitor setup. This may or may not work on multi monitor systems. If you test
++ * let me know the result. As of now it is not tested on multimonitor systems
++ * (I do not own multimonitor setup currently).
++
++ * You are free to modify, use and publish it however you wish, with or without
++ * my permission.
++ */
++
++static enum {
++	NONE  = 0,
++	GET   = 1 << 0,
++	SET   = 1 << 1,
++	WATCH = 1 << 2 | GET,
++} mode = NONE;
++
++struct output {
++	char *name;          /* output name */
++	uint32_t id;         /* registry interface id */
++	uint32_t active;     /* output is active or down */
++
++	uint32_t tags[9][3]; /* replace 9 with the value of TAGCOUNT in dwl */
++
++	uint32_t layout;   /* layout: 0 -> tile, 1 -> float, ... */
++	char *layoutSymbol;        /* layout name */
++
++	char *title;         /* focused client title */
++	char *appid;         /* focused client appid */
++	uint32_t fullscreen; /* is focused client fullscreen */
++	uint32_t floating;   /* is focused client floating */
++
++	struct wl_list link;
++};
++
++/* variables */
++static char *arg_output, *arg_tagset, *arg_ctagset, *arg_layout;
++static size_t layoutcount, layout_idx;
++static uint32_t tagcount, seltags;
++static unsigned int cflag, lflag, tflag, oflag;
++static struct wl_list outputs;
++static struct wl_display *display;
++static struct wl_registry *registry;
++static struct zdwl_ipc_manager_v2 *dwl_ipc_manager;
++
++/* function definitions */
++static void
++dwl_ipc_tags(void *data, struct zdwl_ipc_manager_v2 *ipc_manager, uint32_t count)
++{
++	tagcount = count;
++}
++
++static void
++dwl_ipc_layout(void *data, struct zdwl_ipc_manager_v2 *ipc_manager, const char *name)
++{
++	layoutcount++;
++	if (lflag && (mode & SET) && strcmp(arg_layout, name) == 0)
++		layout_idx = layoutcount;
++}
++
++static const struct zdwl_ipc_manager_v2_listener dwl_ipc_listener = {
++	.tags = dwl_ipc_tags,
++	.layout = dwl_ipc_layout,
++};
++
++static void
++dwl_ipc_output_toggle_visibility(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output) {}
++
++static void
++dwl_ipc_output_active(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output, uint32_t active)
++{
++	struct output *output;
++
++	if (!oflag || !(mode & GET))
++		return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->active = active;
++		}
++}
++
++static void
++dwl_ipc_output_tag(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
++		uint32_t tag, uint32_t state, uint32_t clients, uint32_t focused)
++{
++	struct output *output;
++
++	if (!tflag)
++		return;
++
++	if (mode & SET) {
++		if (state != ZDWL_IPC_OUTPUT_V2_TAG_STATE_NONE)
++			seltags |= 1<<tag;
++		return;
++	}
++
++	if (!(mode & GET))
++		return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->tags[tag][0] = state;
++			output->tags[tag][1] = clients;
++			output->tags[tag][2] = focused;
++		}
++}
++
++static void
++dwl_ipc_output_layout(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
++	uint32_t layout)
++{
++	struct output *output;
++
++	if (!lflag || !(mode & GET))
++		return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->layout = layout;
++		}
++}
++
++static void
++dwl_ipc_output_layout_symbol(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
++	const char *layout)
++{
++	struct output *output;
++
++	if (!lflag || !(mode & GET))
++		return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->layoutSymbol = strdup(layout);
++		}
++}
++
++static void
++dwl_ipc_output_title(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
++	const char *title)
++{
++	struct output *output;
++
++	if (!cflag || !(mode & GET))
++		return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->title = strdup(title);
++		}
++}
++
++static void
++dwl_ipc_output_appid(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
++	const char *appid)
++{
++	struct output *output;
++
++	if (!cflag || !(mode & GET))
++		return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->appid = strdup(appid);
++		}
++}
++
++static void
++dwl_ipc_output_fullscreen(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
++	uint32_t is_fullscreen)
++{
++	struct output *output;
++
++	if (!cflag || !(mode & GET))
++		return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->fullscreen = is_fullscreen;
++		}
++}
++
++static void
++dwl_ipc_output_floating(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output,
++	uint32_t is_floating)
++{
++	struct output *output;
++
++	if (!cflag || !(mode & GET)) return;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->name == data) {
++			output->floating = is_floating;
++		}
++}
++
++static void
++dwl_ipc_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_ipc_output)
++{
++	struct output *output;
++
++	if (mode & SET) {
++		if (cflag) {
++			uint32_t and = ~0, xor = 0;
++			char *t = arg_ctagset;
++			uint32_t i = 0;
++
++			for (; *t && *t >= '0' && *t <= '9'; t++)
++				i = *t-'0' + i*10;
++			if (i < 1 || i > tagcount)
++				die("invalid tagset %s", arg_ctagset);
++			i--;
++
++			if (!*t) {
++				and = 0;
++				xor = 1<<i;
++			}
++
++			for (; *t; t++, i++) {
++				switch (*t) {
++					case '-':
++						and &= ~(1<<i);
++						break;
++					case '+':
++						and &= ~(1<<i);
++						xor |= 1<<i;
++						break;
++					case '^':
++						xor |= 1<<i;
++						break;
++				}
++			}
++
++			zdwl_ipc_output_v2_set_client_tags(dwl_ipc_output, and, xor);
++		}
++		if (tflag) {
++			int toggle;
++			char *t;
++			uint32_t i, mask;
++
++			i = 0;
++			toggle = 1;
++			t = arg_tagset;
++			mask = seltags;
++
++			if (*t == '!') {
++				toggle = 0;
++				t++;
++			}
++
++			for (; *t && *t >= '0' && *t <= '9'; t++)
++				i = *t-'0' + i*10;
++			if (i < 1 || i > tagcount)
++				die("invalid tagset %s", arg_tagset);
++			i--;
++
++			if (toggle && !*t) mask = 1<<i;
++
++			for (; *t; t++, i++) {
++				switch (*t) {
++					case '-':
++						mask &= ~(1<<i);
++						break;
++					case '+':
++						mask |= 1<<i;
++						break;
++					case '^':
++						mask ^= 1<<i;
++						break;
++				}
++			}
++
++			zdwl_ipc_output_v2_set_tags(dwl_ipc_output, mask, toggle);
++		}
++		if (lflag) {
++			if (layout_idx == 0) {
++				for (char *c = arg_layout; *c; c++) {
++					if (*c < '0' || *c > '9')
++						die("invalid layout %s", arg_layout);
++					layout_idx = *c-'0' + layout_idx*10;
++				}
++			}
++			if (layout_idx < 1 || layout_idx > layoutcount)
++				die("invalid layout %s", arg_layout);
++			zdwl_ipc_output_v2_set_layout(dwl_ipc_output, layout_idx-1);
++		}
++
++		wl_display_flush(display);
++		return;
++	}
++
++	wl_list_for_each(output, &outputs, link) {
++		if (output->name == data) {
++			printf("{ \"output\": \"%s\"", output->name);
++			if (oflag)
++				printf(", \"registryId\": %u, \"active\": %s",
++						output->id, output->active ? "true" : "false");
++			if (tflag) {
++				printf(", \"tags\": [");
++				for (uint32_t i=0; i<tagcount; i++) {
++					printf("{ \"tag\": %u, \"state\": %u, "
++							"\"clients\": %u, \"focused\": %u }%s",
++							i+1, output->tags[i][0], output->tags[i][1],
++							output->tags[i][2], (i<tagcount-1) ? ", " : "");
++				}
++				printf("]");
++			}
++			if (lflag)
++				printf(", \"layout\": %u, \"layoutSymbol\": \"%s\"",
++						output->layout, output->layoutSymbol);
++			if (cflag)
++				printf(", \"title\": \"%s\""
++						", \"appid\": \"%s\""
++						", \"fullscreen\": \"%u\""
++						", \"floating\": \"%u\"",
++						output->title, output->appid,
++						output->fullscreen, output->floating);
++			printf(" }\n");
++		}
++	}
++
++	fflush(stdout);
++}
++
++static const struct zdwl_ipc_output_v2_listener dwl_ipc_output_listener = {
++	.toggle_visibility = dwl_ipc_output_toggle_visibility,
++	.active = dwl_ipc_output_active,
++	.tag = dwl_ipc_output_tag,
++	.layout = dwl_ipc_output_layout,
++	.title = dwl_ipc_output_title,
++	.appid = dwl_ipc_output_appid,
++	.layout_symbol = dwl_ipc_output_layout_symbol,
++	.fullscreen = dwl_ipc_output_fullscreen,
++	.floating = dwl_ipc_output_floating,
++	.frame = dwl_ipc_output_frame,
++};
++
++static void
++wl_output_geometry(void *data, struct wl_output *wl_output,
++		int32_t x, int32_t y, int32_t physical_width, int32_t physical_height,
++		int32_t subpixel, const char *make, const char *model, int32_t transform) {}
++
++static void
++wl_output_mode(void *data, struct wl_output *wl_output,
++		uint32_t flags, int32_t width, int32_t height, int32_t refresh) {}
++
++static void
++wl_output_done(void *data, struct wl_output *wl_output) {}
++
++static void
++wl_output_scale(void *data, struct wl_output *wl_output, int32_t factor) {}
++
++static void
++wl_output_name(void *data, struct wl_output *wl_output, const char *name)
++{
++	uint32_t *id;
++	struct output *output;
++
++	if (arg_output && strcmp(arg_output, name) != 0) {
++		wl_output_release(wl_output);
++		return;
++	}
++
++	id = data;
++	wl_list_for_each(output, &outputs, link)
++		if (output->id == *id) {
++			output->name = strdup(name);
++			break;
++		}
++
++	if (dwl_ipc_manager) {
++		struct zdwl_ipc_output_v2 *dwl_ipc_output = zdwl_ipc_manager_v2_get_output(dwl_ipc_manager, wl_output);
++		zdwl_ipc_output_v2_add_listener(dwl_ipc_output, &dwl_ipc_output_listener, output->name);
++	}
++}
++
++static void
++wl_output_description(void *data, struct wl_output *wl_output, const char *description) {}
++
++static const struct wl_output_listener output_listener = {
++	.geometry = wl_output_geometry,
++	.mode = wl_output_mode,
++	.done = wl_output_done,
++	.scale = wl_output_scale,
++	.name = wl_output_name,
++	.description = wl_output_description,
++};
++
++static void
++global_registry_add(void *data, struct wl_registry *wl_registry,
++		uint32_t name, const char *interface, uint32_t version)
++{
++	struct output *o;
++	struct wl_output *wl_output;
++
++	if (strcmp(interface, wl_output_interface.name) == 0) {
++		o = ecalloc(1, sizeof(struct output));
++		o->id = name;
++		wl_list_insert(&outputs, &o->link); /* store output in list of outputs */
++
++		wl_output = wl_registry_bind(
++				wl_registry, name, &wl_output_interface,
++				WL_OUTPUT_NAME_SINCE_VERSION);
++		wl_output_add_listener(wl_output, &output_listener, &o->id);
++	} else if (strcmp(interface, zdwl_ipc_manager_v2_interface.name) == 0) {
++		dwl_ipc_manager = wl_registry_bind(wl_registry, name,
++				&zdwl_ipc_manager_v2_interface, version < 2 ? version : 2);
++		zdwl_ipc_manager_v2_add_listener(dwl_ipc_manager, &dwl_ipc_listener, NULL);
++	}
++}
++
++static void
++global_registry_remove(void *data, struct wl_registry *wl_registry, uint32_t name)
++{
++	struct output *output;
++
++	wl_list_for_each(output, &outputs, link)
++		if (output->id == name) {
++			wl_list_remove(&output->link);
++			free(output);
++			break;
++		}
++}
++
++static const struct wl_registry_listener registry_listener = {
++	.global = global_registry_add,
++	.global_remove = global_registry_remove,
++};
++
++static void
++usage(int code)
++{
++	fprintf(code ? stderr : stdout,
++			"usage:"
++			"\tdwlmsg [-m <monitor>] (-g | -w) [-clot]\n"
++			"\tdwlmsg [-m <monitor>] -s ([-c<tags>] [-t<tags>] [-l<layout>])\n");
++	exit(code);
++}
++
++int
++main(int argc, char *argv[])
++{
++	int c;
++
++	while ((c = getopt(argc, argv, "c::ghl::m:ost::w")) != -1) {
++		switch(c) {
++			case 'c':
++				cflag = 1;
++				if (optarg) arg_ctagset = optarg;
++				break;
++			case 'g':
++				if (mode != NONE) usage(1);
++				mode = GET;
++				break;
++			case 'h':
++				usage(0);
++				break;
++			case 'm':
++				arg_output = optarg;
++				break;
++			case 'l':
++				lflag = 1;
++				if (optarg) arg_layout = optarg;
++				break;
++			case 'o':
++				oflag = 1;
++				break;
++			case 's':
++				if (mode != NONE) usage(1);
++				mode = SET;
++				break;
++			case 'w':
++				if (mode != NONE) usage(1);
++				mode = WATCH;
++				break;
++			case 't':
++				tflag = 1;
++				if (optarg) arg_tagset = optarg;
++				break;
++			case '?':
++				usage(1);
++				break;
++		}
++	}
++
++	if (mode == NONE)
++		usage(1);
++	if ((mode & GET) && (!(cflag|lflag|oflag|tflag)))
++		cflag = lflag = oflag = tflag = 1;
++	if ((mode & SET) && (!(cflag|lflag|tflag)))
++		usage(1);
++	if (mode & GET) {
++		if ((tflag && arg_tagset)
++				|| (cflag && arg_ctagset)
++				|| (lflag && arg_layout))
++			usage(1);
++	}
++	if (mode & SET) {
++		if ((tflag && !arg_tagset)
++				|| (cflag && !arg_ctagset)
++				|| (lflag && !arg_layout))
++			usage(1);
++	}
++
++	display = wl_display_connect(NULL);
++	if (!display)
++		die("could not connect to display");
++
++	registry = wl_display_get_registry(display);
++	if (!registry)
++		die("could not get registry");
++
++	wl_list_init(&outputs);
++
++	wl_registry_add_listener(registry, &registry_listener, NULL);
++
++	wl_display_dispatch(display);
++	wl_display_roundtrip(display);
++
++	if (!dwl_ipc_manager)
++		die("dwl ipc protocol is not present");
++
++	wl_display_roundtrip(display);
++
++	if (mode == WATCH)
++		while (wl_display_dispatch(display) != -1);
++
++	return 0;
++}

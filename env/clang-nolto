@@ -1,0 +1,12 @@
+# Normal settings here
+COMMON_FLAGS="-O2 -march=skylake"
+CFLAGS="${COMMON_FLAGS}"
+CXXFLAGS="${COMMON_FLAGS}"
+FCFLAGS="${COMMON_FLAGS}"
+
+CC="clang"
+CPP="clang-cpp" # necessary for xorg-server and possibly other packages
+CXX="clang++"
+AR="llvm-ar"
+NM="llvm-nm"
+RANLIB="llvm-ranlib"
